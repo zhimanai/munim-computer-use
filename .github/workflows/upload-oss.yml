@@ -1,0 +1,188 @@
+name: Mirror upstream release to OSS
+
+# This fork does not cut its own releases: tags and releases live with
+# upstream (munimtechnologies/munim-computer-use). This mirrors a chosen
+# upstream release into the shared OSS installer bucket so the embedding app
+# can download it without GitHub access.
+#
+#   gh workflow run upload-oss.yml                        # mirror upstream latest
+#   gh workflow run upload-oss.yml -f tag=v0.13.0         # mirror one version
+#   gh workflow run upload-oss.yml -f tag=v0.13.0 -f overwrite=true  # replace
+#
+# Objects land under munim-computer-use/<tag>/ and are immutable by default:
+# an already-populated or partially-populated tag path aborts the run unless
+# overwrite is explicitly requested, and a fully identical mirror is skipped.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (empty = upstream latest release)'
+        type: string
+        default: ''
+      source_repo:
+        description: 'Repository holding the release'
+        type: string
+        default: 'munimtechnologies/munim-computer-use'
+      overwrite:
+        description: 'Replace an existing or partial mirror for this tag'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Objects are immutable per tag; serialize mirrors and never race two runs.
+concurrency:
+  group: munim-oss-mirror
+  cancel-in-progress: false
+
+env:
+  DOWNLOAD_PREFIX: munim-computer-use
+
+jobs:
+  mirror:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      DOWNLOAD_BUCKET: ${{ vars.DOWNLOAD_BUCKET }}
+      DOWNLOAD_REGION: ${{ vars.DOWNLOAD_REGION }}
+      DOWNLOAD_ENDPOINT: ${{ vars.DOWNLOAD_ENDPOINT }}
+      DOWNLOAD_PUBLIC_BASE: ${{ vars.DOWNLOAD_PUBLIC_BASE }}
+      DOWNLOAD_ROLE_ARN: ${{ vars.DOWNLOAD_ROLE_ARN }}
+      DOWNLOAD_OIDC_PROVIDER_ARN: ${{ vars.DOWNLOAD_OIDC_PROVIDER_ARN }}
+      DOWNLOAD_OIDC_AUDIENCE: ${{ vars.DOWNLOAD_OIDC_AUDIENCE }}
+      DOWNLOAD_TAG: ${{ inputs.tag }}
+      DOWNLOAD_SOURCE_REPO: ${{ inputs.source_repo }}
+      DOWNLOAD_OVERWRITE: ${{ inputs.overwrite }}
+    steps:
+      - name: Validate OIDC configuration
+        run: |
+          test -n "$DOWNLOAD_BUCKET" && test -n "$DOWNLOAD_REGION" && test -n "$DOWNLOAD_ENDPOINT" \
+            && test -n "$DOWNLOAD_PUBLIC_BASE" && test -n "$DOWNLOAD_ROLE_ARN" \
+            && test -n "$DOWNLOAD_OIDC_PROVIDER_ARN" && test -n "$DOWNLOAD_OIDC_AUDIENCE"
+
+      - name: Resolve the release to mirror
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "$DOWNLOAD_TAG" ]; then
+            tag="$DOWNLOAD_TAG"
+          else
+            tag=$(gh release view --repo "$DOWNLOAD_SOURCE_REPO" --json tagName --jq .tagName)
+          fi
+          echo "Mirroring tag: $tag"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          # Draft releases are not mirrorable; fail loudly instead.
+          gh release view "$tag" --repo "$DOWNLOAD_SOURCE_REPO" --json isDraft --jq .isDraft | grep -qx false
+
+      - name: Download the release assets from GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          gh release download "$TAG" --repo "$DOWNLOAD_SOURCE_REPO" --dir dist --clobber
+          ls -la dist
+          test -f dist/SHA256SUMS.txt
+
+      - name: Verify the GitHub copies against SHA256SUMS
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS.txt
+
+      - name: Check the target OSS path before uploading
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          base="${DOWNLOAD_PUBLIC_BASE%/}/${DOWNLOAD_PREFIX}/${TAG}"
+          all_present=1
+          any_present=0
+          while IFS= read -r name; do
+            code=$(curl -sS -o /dev/null -I -w '%{http_code}' "$base/$name" || echo 000)
+            case "$code" in
+              404) all_present=0 ;;
+              200) any_present=1 ;;
+              *) echo "::error::Unexpected HTTP $code for $base/$name"; exit 1 ;;
+            esac
+          done < <(awk 'NF > 1 {print $2}' SHA256SUMS.txt)
+          sums_code=$(curl -sS -o /dev/null -I -w '%{http_code}' "$base/SHA256SUMS.txt" || echo 000)
+          case "$sums_code" in
+            200) any_present=1 ;;
+            404) all_present=0 ;;
+            *) echo "::error::Unexpected HTTP $sums_code for $base/SHA256SUMS.txt"; exit 1 ;;
+          esac
+
+          if [ "$all_present" = 1 ] \
+            && curl -sSf "$base/SHA256SUMS.txt" -o remote-SHA256SUMS.txt \
+            && cmp -s SHA256SUMS.txt remote-SHA256SUMS.txt; then
+            echo "Tag $TAG is already fully mirrored with identical bytes; skipping upload."
+            echo "MIRROR_STATE=already" >> "$GITHUB_ENV"
+          elif [ "$any_present" = 1 ]; then
+            if [ "$DOWNLOAD_OVERWRITE" = 'true' ]; then
+              echo "::warning::Replacing the existing mirror for $TAG by explicit request."
+              echo "MIRROR_STATE=overwrite" >> "$GITHUB_ENV"
+            else
+              echo "::error::$TAG is partially mirrored or differs on OSS ($base). Review the prefix, then re-run with overwrite=true or pick another tag."
+              exit 1
+            fi
+          else
+            echo "Target path $base is free."
+            echo "MIRROR_STATE=free" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install pinned official ossutil 2.4.1
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl --fail --location --retry 3 --max-time 180 -o ossutil.zip https://gosspublic.alicdn.com/ossutil/v2/2.4.1/ossutil-2.4.1-linux-amd64.zip
+          echo '57ee4c56796a40144acd6b0b96b53b4ba75e5cec09c01d8d0313c09a5524022f  ossutil.zip' | sha256sum --check --strict
+          unzip -q ossutil.zip -d ossutil-bin
+          chmod +x ossutil-bin/ossutil-2.4.1-linux-amd64/ossutil
+          echo "$RUNNER_TEMP/ossutil-bin/ossutil-2.4.1-linux-amd64" >> "$GITHUB_PATH"
+
+      - name: Obtain short-lived OSS publishing credentials
+        id: credentials
+        uses: aliyun/configure-aliyun-credentials-action@1e5248c8d5d93a8781ac344a68e19a43341e79e6
+        with:
+          role-to-assume: ${{ vars.DOWNLOAD_ROLE_ARN }}
+          oidc-provider-arn: ${{ vars.DOWNLOAD_OIDC_PROVIDER_ARN }}
+          audience: ${{ vars.DOWNLOAD_OIDC_AUDIENCE }}
+          role-session-name: munim-oss-mirror-${{ github.run_id }}
+          role-session-expiration: 3600
+
+      - name: Upload the release to OSS
+        if: env.MIRROR_STATE != 'already'
+        env:
+          OSS_ACCESS_KEY_ID: ${{ steps.credentials.outputs.aliyun-access-key-id }}
+          OSS_ACCESS_KEY_SECRET: ${{ steps.credentials.outputs.aliyun-access-key-secret }}
+          OSS_SESSION_TOKEN: ${{ steps.credentials.outputs.aliyun-security-token }}
+        working-directory: dist
+        run: |
+          ossutil cp -f -r . "oss://$DOWNLOAD_BUCKET/$DOWNLOAD_PREFIX/$TAG/" \
+            --region "$DOWNLOAD_REGION" --endpoint "$DOWNLOAD_ENDPOINT"
+
+      - name: Verify the public OSS copies byte-for-byte
+        if: env.MIRROR_STATE != 'already'
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          mkdir -p ../osscopy
+          base="${DOWNLOAD_PUBLIC_BASE%/}/${DOWNLOAD_PREFIX}/${TAG}"
+          curl --fail --silent --show-error --retry 5 --retry-delay 2 "$base/SHA256SUMS.txt" -o ../osscopy/SHA256SUMS.txt
+          while IFS= read -r name; do
+            curl --fail --silent --show-error --retry 5 --retry-delay 2 "$base/$name" -o "../osscopy/$name"
+          done < <(awk 'NF > 1 {print $2}' SHA256SUMS.txt)
+          (cd ../osscopy && sha256sum -c SHA256SUMS.txt)
+
+      - name: Write the run summary
+        if: always()
+        run: |
+          {
+            echo "## munim-computer-use ${TAG:-} on OSS"
+            echo
+            echo "State: ${MIRROR_STATE:-not-reached}"
+            echo
+            echo "Public base: ${DOWNLOAD_PUBLIC_BASE%/}/${DOWNLOAD_PREFIX}/${TAG:-}/"
+          } >> "$GITHUB_STEP_SUMMARY"
