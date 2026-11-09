@@ -33,7 +33,7 @@ installer bucket on manual dispatch:
 gh workflow run upload-oss.yml -f tag=v0.13.0   # empty tag = upstream latest
 ```
 
-- Destination: `https://micius-desktop-installer.oss-cn-beijing.aliyuncs.com/munim-computer-use/<tag>/` (region `cn-beijing`)
+- Destination: `https://micius-harness-installer.oss-cn-beijing.aliyuncs.com/munim-computer-use/<tag>/` (region `cn-beijing`; the bucket policy grants anonymous read on that prefix)
 - Auth: GitHub Actions OIDC → RAM role `munim-release-publisher` (policy
   `MunimReleasePublish`, scoped to the `munim-computer-use/*` prefix; no
   delete or bucket administration). The repo holds **no** cloud secrets — only
